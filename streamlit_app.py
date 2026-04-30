@@ -1,6 +1,7 @@
-# nexus_trading_address.py
+# streamlit_app.py
 # Curtley James — BMI / Central
-# Run with: streamlit run nexus_trading_address.py
+# Nexus Trading Address Finder — Render + Google Drive Edition
+# Run with: streamlit run streamlit_app.py
 
 import streamlit as st
 import pandas as pd
@@ -11,9 +12,19 @@ import re
 import time
 import csv
 import os
+import io
+import json
 import threading
 import queue
-from io import StringIO
+
+# Google Drive (service account) — gracefully optional so local dev still works
+try:
+    from google.oauth2 import service_account
+    from googleapiclient.discovery import build
+    from googleapiclient.http import MediaIoBaseUpload, MediaIoBaseDownload
+    HAS_GDRIVE = True
+except ImportError:
+    HAS_GDRIVE = False
 
 # ---------------------------------------------------------------------------
 # UK & Ireland geographic reference data
@@ -97,7 +108,7 @@ EXCLUDED_TERMS = re.compile(
     re.I
 )
 
-HEADERS = {
+FETCH_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -110,32 +121,87 @@ HEADERS = {
 OUTPUT_COLS = ["Company Name", "Website", "Country",
                "Street", "City", "State/County", "Post Code", "Found Country"]
 
-# ---------------------------------------------------------------------------
-# Header auto-detection
-# ---------------------------------------------------------------------------
-
 HEADER_PATTERNS = {
     "name":    re.compile(r'company|business|organisation|organization|name', re.I),
     "website": re.compile(r'website|url|web|domain|site', re.I),
     "country": re.compile(r'country|nation|market|territory', re.I),
 }
 
-def detect_columns(df_columns):
+# ---------------------------------------------------------------------------
+# Google Drive helpers
+# ---------------------------------------------------------------------------
+
+def _drive_service():
+    """Build a Drive service from Streamlit secrets (service account JSON)."""
+    if not HAS_GDRIVE:
+        return None
+    try:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds = service_account.Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/drive"]
+        )
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
+    except Exception:
+        return None
+
+
+def gdrive_find_file(service, name, folder_id):
+    """Return file ID if name exists in folder, else None."""
+    try:
+        q = (f"name='{name}' and '{folder_id}' in parents "
+             f"and trashed=false")
+        res = service.files().list(q=q, fields="files(id,name)").execute()
+        files = res.get("files", [])
+        return files[0]["id"] if files else None
+    except Exception:
+        return None
+
+
+def gdrive_upload_csv(service, csv_bytes, name, folder_id, file_id=None):
     """
-    Returns dict {name, website, country} → column name or None if not found.
+    Create or update a CSV file in Drive.
+    Returns the file ID.
     """
-    result = {}
-    for key, pattern in HEADER_PATTERNS.items():
-        match = next((c for c in df_columns if pattern.search(str(c))), None)
-        result[key] = match
-    return result
+    try:
+        media = MediaIoBaseUpload(
+            io.BytesIO(csv_bytes),
+            mimetype="text/csv",
+            resumable=False
+        )
+        if file_id:
+            service.files().update(fileId=file_id, media_body=media).execute()
+            return file_id
+        else:
+            meta = {"name": name, "parents": [folder_id]}
+            f = service.files().create(
+                body=meta, media_body=media, fields="id"
+            ).execute()
+            return f["id"]
+    except Exception:
+        return None
+
+
+def gdrive_download_csv(service, file_id):
+    """Download a Drive file and return its bytes."""
+    try:
+        buf = io.BytesIO()
+        req = service.files().get_media(fileId=file_id)
+        dl  = MediaIoBaseDownload(buf, req)
+        done = False
+        while not done:
+            _, done = dl.next_chunk()
+        return buf.getvalue()
+    except Exception:
+        return None
+
 
 # ---------------------------------------------------------------------------
-# Scraping engine (same logic as tkinter version, extracted to plain functions)
+# Scraping engine
 # ---------------------------------------------------------------------------
 
 def fetch_html(url):
-    req = urllib.request.Request(url, headers=HEADERS)
+    req = urllib.request.Request(url, headers=FETCH_HEADERS)
     try:
         with urllib.request.urlopen(req, timeout=12) as resp:
             return resp.read().decode("utf-8", errors="ignore"), resp.geturl()
@@ -185,9 +251,7 @@ def find_link(html, base_url, pattern):
 
 def normalise_country(raw):
     r = raw.strip().lower()
-    if r in {"ireland", "republic of ireland", "eire"}:
-        return "Ireland"
-    return "United Kingdom"
+    return "Ireland" if r in {"ireland", "republic of ireland", "eire"} else "United Kingdom"
 
 
 def parse_address_block(block, postcode):
@@ -292,223 +356,256 @@ def find_trading_address(raw_url):
                 pages.append(h)
             break
 
-    pages.reverse()   # contact/about checked first
+    pages.reverse()
     for html in pages:
         result = extract_address_from_html(html)
         if result:
             return result
     return {}
 
+
+def detect_columns(df_columns):
+    result = {}
+    for key, pattern in HEADER_PATTERNS.items():
+        match = next((c for c in df_columns if pattern.search(str(c))), None)
+        result[key] = match
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Worker thread
 # ---------------------------------------------------------------------------
 
 def run_worker(rows, col_name, col_website, col_country,
-               output_path, already_done, q):
+               output_filename, already_done, q,
+               drive_service, drive_folder_id, drive_file_id_ref):
     """
-    Processes rows, writes checkpoint CSV after every row,
-    pushes log strings to queue q.
-    Skips websites already in already_done set.
-    """
-    total = len(rows)
+    Processes rows, checkpoints to an in-memory buffer after every row,
+    optionally syncs to Google Drive, and pushes log strings to queue q.
 
-    # Open in append mode if resuming, write mode if fresh
-    file_exists = os.path.exists(output_path)
-    mode = 'a' if file_exists and already_done else 'w'
+    drive_file_id_ref is a list[str|None] — mutable so we can update the
+    Drive file ID from inside the thread.
+    """
+    total   = len(rows)
+    # In-memory CSV buffer (rebuilt fully each checkpoint for Drive sync)
+    results = []  # list of dicts
+
+    # Pre-populate with already-done rows from Drive if resuming
+    already_done_set = set(already_done.keys())
+    for website, row_data in already_done.items():
+        results.append(row_data)
+
+    def _csv_bytes(rows_data):
+        buf = io.StringIO()
+        w   = csv.DictWriter(buf, fieldnames=OUTPUT_COLS)
+        w.writeheader()
+        w.writerows(rows_data)
+        return buf.getvalue().encode("utf-8")
+
+    def _checkpoint():
+        """Push current results to Drive."""
+        if drive_service and drive_folder_id:
+            data = _csv_bytes(results)
+            fid  = gdrive_upload_csv(
+                drive_service, data,
+                output_filename, drive_folder_id,
+                drive_file_id_ref[0]
+            )
+            if fid:
+                drive_file_id_ref[0] = fid
 
     try:
-        with open(output_path, mode, newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            if mode == 'w':
-                writer.writerow(OUTPUT_COLS)
+        for i, row in enumerate(rows, 1):
+            name    = str(row.get(col_name,    "") or "").strip() if col_name    else ""
+            website = str(row.get(col_website, "") or "").strip()
+            country = str(row.get(col_country, "") or "").strip() if col_country else ""
 
-            for i, row in enumerate(rows, 1):
-                name    = str(row.get(col_name,    "") or "").strip()
-                website = str(row.get(col_website, "") or "").strip()
-                country = str(row.get(col_country, "") or "").strip()
+            if not website:
+                q.put(f"[{i}/{total}] SKIP — no website  {name}")
+                results.append({
+                    "Company Name": name, "Website": website, "Country": country,
+                    "Street": "", "City": "", "State/County": "",
+                    "Post Code": "", "Found Country": ""
+                })
+                _checkpoint()
+                continue
 
-                if not website:
-                    q.put(f"[{i}/{total}] SKIP (no website)  {name}")
-                    writer.writerow([name, website, country, "", "", "", "", ""])
-                    f.flush()
-                    continue
+            if website in already_done_set:
+                q.put(f"[{i}/{total}] SKIP — already done  {website}")
+                continue
 
-                if website in already_done:
-                    q.put(f"[{i}/{total}] SKIP (already done)  {website}")
-                    continue
+            q.put(f"[{i}/{total}]  {name or website}")
+            addr = find_trading_address(website)
 
-                q.put(f"[{i}/{total}] Processing  {name or website}")
-                addr = find_trading_address(website)
+            street   = addr.get("street",   "")
+            city     = addr.get("city",     "")
+            county   = addr.get("county",   "")
+            postcode = addr.get("postcode", "")
+            fc       = addr.get("country",  "")
 
-                street   = addr.get("street",   "")
-                city     = addr.get("city",     "")
-                county   = addr.get("county",   "")
-                postcode = addr.get("postcode", "")
-                fc       = addr.get("country",  "")
+            if any([street, city, county, postcode]):
+                q.put(f"         ✓  {street} | {city} | {county} | {postcode}")
+            else:
+                q.put(f"         ✗  No trading address found")
 
-                if any([street, city, county, postcode]):
-                    q.put(f"         ✓  {street} | {city} | {county} | {postcode}")
-                else:
-                    q.put(f"         ✗  No trading address found")
+            results.append({
+                "Company Name": name,    "Website": website,  "Country": country,
+                "Street": street,        "City": city,        "State/County": county,
+                "Post Code": postcode,   "Found Country": fc
+            })
 
-                writer.writerow([name, website, country,
-                                 street, city, county, postcode, fc])
-                f.flush()
-                time.sleep(0.4)
+            already_done_set.add(website)
+            _checkpoint()
+            time.sleep(0.4)
 
-        q.put("__DONE__")
+        # Final sync
+        _checkpoint()
+        q.put({"__DONE__": True, "results": results})
 
     except Exception as e:
         q.put(f"__ERROR__ {e}")
+
 
 # ---------------------------------------------------------------------------
 # Streamlit UI
 # ---------------------------------------------------------------------------
 
 st.set_page_config(
-    page_title="Nexus Trading Address Finder",
+    page_title="Nexus · Trading Address Finder",
     page_icon="🏢",
     layout="wide"
 )
 
 st.title("🏢 Nexus Trading Address Finder")
-st.caption("UK & Ireland · Scrapes trading addresses from company websites")
+st.caption("UK & Ireland  ·  Scrapes trading addresses from company websites  ·  Auto-saves to Google Drive")
 
-# ── Session state init ──────────────────────────────────────────────────────
+# Session state
 for key, default in [
-    ("df", None),
-    ("col_map", {}),
-    ("confirmed", False),
-    ("running", False),
-    ("log_lines", []),
-    ("output_path", ""),
-    ("worker_queue", None),
-    ("upload_name", ""),
-    ("upload_dir", ""),
+    ("df", None), ("col_map", {}), ("confirmed", False),
+    ("running", False), ("log_lines", []), ("results", []),
+    ("output_filename", ""), ("worker_queue", None),
+    ("drive_file_id", [None]),   # mutable ref
+    ("already_done", {}),
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
 
-# ── Step 1: Upload ───────────────────────────────────────────────────────────
+# Drive setup (silent — only shown if secrets exist)
+drive_service   = _drive_service() if HAS_GDRIVE else None
+drive_folder_id = None
+if drive_service:
+    try:
+        drive_folder_id = st.secrets.get("gdrive_folder_id", None)
+    except Exception:
+        pass
+
+if drive_service and drive_folder_id:
+    st.success("✅ Google Drive connected — results will auto-save after every row.")
+else:
+    st.info("ℹ️ Google Drive not configured — results available via download button only.")
+
+# ── Step 1: Upload ────────────────────────────────────────────────────────────
 st.header("Step 1 — Upload your file")
 uploaded = st.file_uploader("CSV or XLSX", type=["csv", "xlsx"])
 
-if uploaded:
+if uploaded and not st.session_state.running:
     name = uploaded.name
-    # Save to a temp location alongside a fixed output name
-    save_dir = os.path.join(os.path.expanduser("~"), "NexusOutput")
-    os.makedirs(save_dir, exist_ok=True)
-    input_path  = os.path.join(save_dir, name)
-    base, _     = os.path.splitext(name)
-    output_path = os.path.join(save_dir, f"{base}-addresses.csv")
-
-    # Write uploaded bytes to disk so we can re-read with pandas
-    with open(input_path, "wb") as fout:
-        fout.write(uploaded.read())
+    base, _ = os.path.splitext(name)
+    output_filename = f"{base}-addresses.csv"
+    st.session_state.output_filename = output_filename
 
     try:
         if name.endswith(".csv"):
-            df = pd.read_csv(input_path, encoding="utf-8-sig", dtype=str).fillna("")
+            df = pd.read_csv(io.BytesIO(uploaded.read()), dtype=str).fillna("")
         else:
-            df = pd.read_excel(input_path, dtype=str).fillna("")
+            df = pd.read_excel(io.BytesIO(uploaded.read()), dtype=str).fillna("")
     except Exception as e:
         st.error(f"Could not read file: {e}")
         st.stop()
 
-    st.session_state.df          = df
-    st.session_state.upload_name = name
-    st.session_state.output_path = output_path
-    st.session_state.confirmed   = False
+    st.session_state.df        = df
+    st.session_state.col_map   = detect_columns(df.columns.tolist())
+    st.session_state.confirmed = False
+    st.session_state.results   = []
+    st.session_state.drive_file_id = [None]
 
-    # Auto-detect columns
-    detected = detect_columns(df.columns.tolist())
-    st.session_state.col_map = detected
+    # Check Drive for existing checkpoint
+    already_done = {}
+    if drive_service and drive_folder_id:
+        fid = gdrive_find_file(drive_service, output_filename, drive_folder_id)
+        if fid:
+            raw = gdrive_download_csv(drive_service, fid)
+            if raw:
+                try:
+                    done_df = pd.read_csv(io.BytesIO(raw), dtype=str).fillna("")
+                    for _, row in done_df.iterrows():
+                        w = str(row.get("Website", "")).strip()
+                        if w:
+                            already_done[w] = row.to_dict()
+                    st.session_state.drive_file_id = [fid]
+                except Exception:
+                    pass
 
-# ── Step 2: Confirm column mapping ──────────────────────────────────────────
+    st.session_state.already_done = already_done
+
+# ── Step 2: Column mapping ────────────────────────────────────────────────────
 if st.session_state.df is not None:
-    df = st.session_state.df
-    st.header("Step 2 — Confirm column mapping")
-
-    cols = ["(not found)"] + df.columns.tolist()
+    df       = st.session_state.df
     detected = st.session_state.col_map
 
-    def safe_index(col_name):
-        if col_name and col_name in df.columns.tolist():
-            return cols.index(col_name)
+    st.header("Step 2 — Confirm column mapping")
+    cols = ["(not mapped)"] + df.columns.tolist()
+
+    def safe_idx(col):
+        if col and col in df.columns.tolist():
+            return cols.index(col)
         return 0
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        sel_name = st.selectbox(
-            "Company Name column",
-            cols, index=safe_index(detected.get("name")),
-            help="Auto-detected from header keywords"
-        )
-    with col2:
-        sel_website = st.selectbox(
-            "Website column",
-            cols, index=safe_index(detected.get("website")),
-            help="Auto-detected from header keywords"
-        )
-    with col3:
-        sel_country = st.selectbox(
-            "Country column",
-            cols, index=safe_index(detected.get("country")),
-            help="Auto-detected from header keywords"
-        )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        sel_name    = st.selectbox("Company Name column", cols, index=safe_idx(detected.get("name")))
+    with c2:
+        sel_website = st.selectbox("Website column",      cols, index=safe_idx(detected.get("website")))
+    with c3:
+        sel_country = st.selectbox("Country column",      cols, index=safe_idx(detected.get("country")))
 
-    # Show detection confidence
-    confidence_rows = []
+    # Confidence table
+    conf_rows = []
     for label, sel, key in [
-        ("Company Name", sel_name,    "name"),
+        ("Company Name", sel_name, "name"),
         ("Website",      sel_website, "website"),
         ("Country",      sel_country, "country"),
     ]:
         auto = detected.get(key)
-        if auto and auto == sel:
-            status = "✅ Auto-detected"
-        elif sel == "(not found)":
-            status = "⚠️ Not mapped"
-        else:
-            status = "✏️ Manually selected"
-        confidence_rows.append({"Field": label, "Mapped to": sel, "Status": status})
+        status = ("✅ Auto-detected" if auto and auto == sel
+                  else "⚠️ Not mapped" if sel == "(not mapped)"
+                  else "✏️ Manually selected")
+        conf_rows.append({"Field": label, "Mapped to": sel, "Status": status})
+    st.table(pd.DataFrame(conf_rows))
 
-    st.table(pd.DataFrame(confidence_rows))
-
-    if sel_website == "(not found)":
-        st.warning("Website column must be mapped before you can run.")
+    if sel_website == "(not mapped)":
+        st.warning("Website column must be mapped before running.")
     else:
-        # Resume detection
-        output_path   = st.session_state.output_path
-        already_done  = set()
-        resume_note   = ""
-        if os.path.exists(output_path):
-            try:
-                done_df = pd.read_csv(output_path, dtype=str).fillna("")
-                if "Website" in done_df.columns:
-                    already_done = set(done_df["Website"].tolist())
-                    resume_note  = (
-                        f"♻️ Existing output found with **{len(already_done)}** "
-                        f"processed rows — will resume from where it left off."
-                    )
-            except Exception:
-                pass
-
-        if resume_note:
-            st.info(resume_note)
-
+        already_done = st.session_state.already_done
         remaining = len([
             r for _, r in df.iterrows()
             if str(r.get(sel_website, "")).strip() not in already_done
                and str(r.get(sel_website, "")).strip()
         ])
-        st.caption(f"{len(df)} total rows · {len(already_done)} already done · **{remaining} to process**")
 
-        if st.button("✅ Confirm mapping and start", type="primary",
+        if already_done:
+            st.info(
+                f"♻️ Resuming — **{len(already_done)}** rows already done in Drive, "
+                f"**{remaining}** remaining."
+            )
+        else:
+            st.caption(f"{len(df)} total rows  ·  {remaining} to process")
+
+        if st.button("✅ Confirm and start", type="primary",
                      disabled=st.session_state.running):
-            st.session_state.confirmed  = True
-            st.session_state.running    = True
-            st.session_state.log_lines  = []
+            st.session_state.confirmed    = True
+            st.session_state.running      = True
+            st.session_state.log_lines    = []
             st.session_state.worker_queue = queue.Queue()
 
             rows = df.to_dict(orient="records")
@@ -516,60 +613,67 @@ if st.session_state.df is not None:
                 target=run_worker,
                 args=(
                     rows,
-                    sel_name    if sel_name    != "(not found)" else None,
+                    sel_name    if sel_name    != "(not mapped)" else None,
                     sel_website,
-                    sel_country if sel_country != "(not found)" else None,
-                    output_path,
+                    sel_country if sel_country != "(not mapped)" else None,
+                    st.session_state.output_filename,
                     already_done,
                     st.session_state.worker_queue,
+                    drive_service,
+                    drive_folder_id,
+                    st.session_state.drive_file_id,
                 ),
                 daemon=True
             )
             t.start()
             st.rerun()
 
-# ── Step 3: Live progress ────────────────────────────────────────────────────
+# ── Step 3: Live progress ─────────────────────────────────────────────────────
 if st.session_state.running:
     st.header("Step 3 — Live Progress")
-
-    q = st.session_state.worker_queue
+    q    = st.session_state.worker_queue
     done = False
 
-    # Drain the queue into session log
     while not q.empty():
         msg = q.get_nowait()
-        if msg == "__DONE__":
-            done = True
+        if isinstance(msg, dict) and "__DONE__" in msg:
+            st.session_state.results = msg["results"]
             st.session_state.running = False
-        elif msg.startswith("__ERROR__"):
+            done = True
+        elif isinstance(msg, str) and msg.startswith("__ERROR__"):
             st.session_state.log_lines.append(f"❌ {msg[9:]}")
             st.session_state.running = False
             done = True
         else:
-            st.session_state.log_lines.append(msg)
+            st.session_state.log_lines.append(str(msg))
 
-    log_text = "\n".join(st.session_state.log_lines[-200:])  # last 200 lines
-    st.text_area("Log", value=log_text, height=420, label_visibility="collapsed")
+    log_text = "\n".join(st.session_state.log_lines[-300:])
+    st.text_area("", value=log_text, height=460, label_visibility="collapsed")
 
     if not done:
         time.sleep(1.5)
-        st.rerun()   # poll until worker finishes
+        st.rerun()
     else:
-        st.success("✅ Process complete!")
+        st.success("✅ Complete!")
+        st.rerun()
 
-# ── Step 4: Download ─────────────────────────────────────────────────────────
-if not st.session_state.running and st.session_state.output_path:
-    output_path = st.session_state.output_path
-    if os.path.exists(output_path):
-        st.header("Step 4 — Download Results")
-        result_df = pd.read_csv(output_path, dtype=str).fillna("")
-        st.dataframe(result_df, use_container_width=True)
+# ── Step 4: Download ──────────────────────────────────────────────────────────
+if not st.session_state.running and st.session_state.results:
+    st.header("Step 4 — Results")
 
-        with open(output_path, "rb") as f:
-            st.download_button(
-                label="⬇️ Download addresses CSV",
-                data=f.read(),
-                file_name=os.path.basename(output_path),
-                mime="text/csv"
-            )
-        st.caption(f"File also saved locally at: `{output_path}`")
+    result_df = pd.DataFrame(st.session_state.results, columns=OUTPUT_COLS)
+    found     = result_df["Post Code"].astype(bool).sum()
+    st.caption(f"{len(result_df)} rows  ·  {found} addresses found  ·  {len(result_df) - found} not found")
+    st.dataframe(result_df, use_container_width=True)
+
+    buf = io.StringIO()
+    result_df.to_csv(buf, index=False)
+    st.download_button(
+        label="⬇️ Download results CSV",
+        data=buf.getvalue().encode("utf-8"),
+        file_name=st.session_state.output_filename,
+        mime="text/csv"
+    )
+
+    if drive_service and drive_folder_id:
+        st.info(f"📁 Also saved to Google Drive as `{st.session_state.output_filename}`")
