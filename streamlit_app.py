@@ -446,7 +446,10 @@ def run_worker(rows, col_name, col_website, col_country,
             cached = cache_get(address_cache, name) if name else None
             if cached is not None:
                 cache_hits += 1
-                q.put(f"[{i}/{total}] CACHE  {name}")
+                has_addr = any([cached.get("street"), cached.get("city"),
+                                cached.get("county"), cached.get("postcode")])
+                tag = "CACHE ✓" if has_addr else "CACHE ✗"
+                q.put(f"[{i}/{total}] {tag}  {name}")
                 shared_results.append({
                     "Company Name":  name,
                     "Website":       website,
@@ -493,9 +496,10 @@ def run_worker(rows, col_name, col_website, col_country,
             })
             already_done_websites.add(website)
 
-            # Cache only successful scrapes
-            if name and any([street, city, county, postcode]):
-                cache_set(address_cache, name, addr)
+            # Cache every scraped company — empty dict = "tried, nothing found"
+            # This prevents re-scraping on future runs regardless of outcome
+            if name:
+                cache_set(address_cache, name, addr if addr else {})
 
             _checkpoint()
             time.sleep(0.4)
